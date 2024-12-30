@@ -25,11 +25,8 @@ class LatentDistribution:
             assert noise.device == self.mean.device
             noise = noise.to(self.mean.dtype)
 
-        if temperature != 1.0:
-            raise NotImplementedError(f"Temperature {temperature} is not supported.")
-
         # Just Gaussian sample with no scaling of variance.
-        return noise * torch.exp(self.logvar * 0.5) + self.mean
+        return noise * torch.exp(self.logvar * (0.5*temperature)) + self.mean, noise,self.mean
 
     def mode(self):
         return self.mean
