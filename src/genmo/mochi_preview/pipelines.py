@@ -529,9 +529,9 @@ def sample_model_w_image(device, dit, vae_encoder,conditioning,starting_image,vi
     with move_to_device(vae_encoder,device):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             actual_latents = vae_encoder(video)
-    
-    #mask_latents =  torch.ones_like(actual_latents.mean)  
-    #mask_latents[:,:,repeat,:,:] = 0
+    if(starting_image):
+        mask_latents =  torch.ones_like(actual_latents.mean)  
+        mask_latents[:,:,repeat,:,:] = 0
     assert_eq(len(cfg_schedule), sample_steps, "cfg_schedule must have length sample_steps")
     assert_eq((t - 1) % 6, 0, "t - 1 must be divisible by 6")
     assert_eq(
@@ -550,12 +550,11 @@ def sample_model_w_image(device, dit, vae_encoder,conditioning,starting_image,vi
         (B, IN_CHANNELS, latent_t, latent_h, latent_w),
         device=device,
         dtype=torch.bfloat16,
-    )*np.sqrt(strength)
+    )
     noised_video_latents,noise,clean_latents = actual_latents.sample() ## Returns the noised video latents, noise, and latents before noise is added
     noised_video_latents = vae_latents_to_dit_latents(noised_video_latents)
     num_latents = latent_t * latent_h * latent_w
     cond_batched = cond_text = cond_null = None
-    breakpoint()
     if "cond" in conditioning:
         cond_text = conditioning["cond"]
         cond_null = conditioning["null"]
@@ -580,7 +579,11 @@ def sample_model_w_image(device, dit, vae_encoder,conditioning,starting_image,vi
         out_uncond = out_uncond.to(z)
         out_cond = out_cond.to(z)
         return out_uncond + cfg_scale * (out_cond - out_uncond)
-    z = (1-strength)*noised_video_latents+strength*z
+    if(starting_image):
+        z = (1-mask_latents)*(1-strength)*noised_video_latents+ mask_latents*strength*z
+    else:
+        z = (1-strength)*noised_video_latents+strength*z
+
     # Euler sampler w/ customizable sigma schedule & cfg scale
     for i in get_new_progress_bar(range(0, sample_steps), desc="Sampling"):
         sigma = sigma_schedule[i]
@@ -594,8 +597,9 @@ def sample_model_w_image(device, dit, vae_encoder,conditioning,starting_image,vi
         assert pred.dtype == torch.bfloat16
 
         z = z + dsigma * pred
-        #original_latents_with_noise = (1-sigma_schedule[i+1])*clean_latents+sigma_schedule[i+1]*noise
-        #z = (1-mask_latents)*original_latents_with_noise+ mask_latents*z
+        if(starting_image):
+            pass
+            #z = (1-mask_latents)*(1-sigma_schedule[i+1])*noised_video_latents+ mask_latents*z
 
 
     z = z[:B] if cond_batched else z
