@@ -74,12 +74,17 @@ def generate_video(
     seed,
     cfg_scale,
     num_inference_steps,
+    threshold_noise=0,
+    linear_steps=None,
+    output_dir="outputs",
+    starting_image=None,
+    video_path=None,
+    interweave_frequency=30
 ):
     load_model()
 
-    # sigma_schedule should be a list of floats of length (num_inference_steps + 1),
-    # such that sigma_schedule[0] == 1.0 and sigma_schedule[-1] == 0.0 and monotonically decreasing.
-    sigma_schedule = linear_quadratic_schedule(num_inference_steps, 0.025)
+    # Fast mode parameters: threshold_noise=0.1, linear_steps=6, cfg_scale=1.5, num_inference_steps=8
+    sigma_schedule = linear_quadratic_schedule(num_inference_steps, threshold_noise, linear_steps,strength)
 
     # cfg_schedule should be a list of floats of length num_inference_steps.
     # For simplicity, we just use the same cfg scale at all timesteps,
@@ -151,21 +156,67 @@ inviting atmosphere.
 @click.option("--model_dir", required=True, help="Path to the model directory.")
 @click.option("--lora_path", required=False, help="Path to the lora file.")
 @click.option("--cpu_offload", is_flag=True, help="Whether to offload model to CPU")
+@click.option("--out_dir", default="outputs", help="Output directory for generated videos")
+@click.option("--threshold-noise", default=0.025, help="threshold noise")
+@click.option("--linear-steps", default=None, type=int, help="linear steps")
+@click.option("--starting_image",required=False,help="Path to image")
+@click.option("--video_path",required=False,help="Path to video")
+@click.option("--interweave_frequency",type=int,required=False,help="How frequently to interweave the image with the video")
 def generate_cli(
-    prompt, negative_prompt, width, height, num_frames, seed, cfg_scale, num_steps, model_dir, lora_path, cpu_offload
+    prompt, sweep_file, negative_prompt, strength,width, height, num_frames, seed, cfg_scale, num_steps, 
+    model_dir, lora_path, cpu_offload, out_dir, threshold_noise, linear_steps,starting_image,video_path,interweave_frequency
 ):
     configure_model(model_dir, lora_path, cpu_offload)
-    output = generate_video(
-        prompt,
-        negative_prompt,
-        width,
-        height,
-        num_frames,
-        seed,
-        cfg_scale,
-        num_steps,
-    )
-    click.echo(f"Video generated at: {output}")
+
+    if sweep_file:
+        with open(sweep_file, 'r') as f:
+            for i, line in enumerate(f):
+                if not line.strip():
+                    continue
+                config = json.loads(line)
+                current_prompt = config.get('prompt', prompt)
+                current_cfg_scale = config.get('cfg_scale', cfg_scale)
+                current_num_steps = config.get('num_steps', num_steps)
+                current_threshold_noise = config.get('threshold_noise', threshold_noise)
+                current_linear_steps = config.get('linear_steps', linear_steps)
+                current_seed = config.get('seed', seed)
+                current_width = config.get('width', width)
+                current_height = config.get('height', height)
+                current_num_frames = config.get('num_frames', num_frames)
+
+                output_path = generate_video(
+                    current_prompt,
+                    negative_prompt,
+                    current_width,
+                    current_height,
+                    current_num_frames,
+                    current_seed,
+                    current_cfg_scale,
+                    current_num_steps,
+                    threshold_noise=current_threshold_noise,
+                    linear_steps=current_linear_steps,
+                    output_dir=out_dir,
+                )
+                click.echo(f"Video {i+1} generated at: {output_path}")
+    else:
+        output_path = generate_video(
+            prompt,
+            negative_prompt,
+            strength,
+            width,
+            height,
+            num_frames,
+            seed,
+            cfg_scale,
+            num_steps,
+            threshold_noise=threshold_noise,
+            linear_steps=linear_steps,
+            output_dir=out_dir,
+            starting_image=starting_image,
+            video_path=video_path,
+            interweave_frequency=interweave_frequency
+        )
+        click.echo(f"Video generated at: {output_path}")
 
 
 if __name__ == "__main__":
