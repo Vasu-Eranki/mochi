@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Union, cast
-
+from einops import rearrange
 import numpy as np
 import ray
 import torch
@@ -26,6 +26,8 @@ from torch.distributed.fsdp.wrap import (
     lambda_auto_wrap_policy,
     transformer_auto_wrap_policy,
 )
+from torchvision.io import decode_image,read_video
+import torchvision.transforms as T
 from transformers import T5EncoderModel, T5Tokenizer
 from transformers.models.t5.modeling_t5 import T5Block
 
@@ -38,8 +40,9 @@ from genmo.mochi_preview.vae.models import (
     decode_latents,
     decode_latents_tiled_full,
     decode_latents_tiled_spatial,
+    add_fourier_features
 )
-from genmo.mochi_preview.vae.vae_stats import dit_latents_to_vae_latents
+from genmo.mochi_preview.vae.vae_stats import dit_latents_to_vae_latents,vae_latents_to_dit_latents
 
 
 def load_to_cpu(p, weights_only=True):
@@ -49,21 +52,22 @@ def load_to_cpu(p, weights_only=True):
         assert p.endswith(".pt")
         return torch.load(p, map_location="cpu", weights_only=weights_only)
 
-
-def linear_quadratic_schedule(num_steps, threshold_noise, linear_steps=None):
+def linear_quadratic_schedule(num_steps, threshold_noise, linear_steps=None,strength=1):
+    num_steps = num_steps
     if linear_steps is None:
         linear_steps = num_steps // 2
-    linear_sigma_schedule = [i * threshold_noise / linear_steps for i in range(linear_steps)]
+    linear_sigma_schedule = [(i * threshold_noise / linear_steps) for i in range(linear_steps)]
     threshold_noise_step_diff = linear_steps - threshold_noise * num_steps
+
     quadratic_steps = num_steps - linear_steps
     quadratic_coef = threshold_noise_step_diff / (linear_steps * quadratic_steps**2)
     linear_coef = threshold_noise / linear_steps - 2 * threshold_noise_step_diff / (quadratic_steps**2)
-    const = quadratic_coef * (linear_steps**2)
+    const = quadratic_coef * (linear_steps**2)  
     quadratic_sigma_schedule = [
         quadratic_coef * (i**2) + linear_coef * i + const for i in range(linear_steps, num_steps)
     ]
     sigma_schedule = linear_sigma_schedule + quadratic_sigma_schedule + [1.0]
-    sigma_schedule = [1.0 - x for x in sigma_schedule]
+    sigma_schedule = [(1- x)*strength for x in sigma_schedule]
     return sigma_schedule
 
 
@@ -77,8 +81,8 @@ def setup_fsdp_sync(model, device_id, *, param_dtype, auto_wrap_policy) -> FSDP:
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         mixed_precision=MixedPrecision(
             param_dtype=param_dtype,
-            reduce_dtype=torch.float32,
-            buffer_dtype=torch.float32,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
         ),
         auto_wrap_policy=auto_wrap_policy,
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
@@ -115,7 +119,7 @@ class T5ModelFactory(ModelFactory):
             model = setup_fsdp_sync(
                 model,
                 device_id=device_id,
-                param_dtype=torch.float32,
+                param_dtype=torch.bfloat16,
                 auto_wrap_policy=partial(
                     transformer_auto_wrap_policy,
                     transformer_layer_cls={
@@ -236,7 +240,7 @@ class DitModelFactory(ModelFactory):
             model = setup_fsdp_sync(
                 model,
                 device_id=device_id,
-                param_dtype=torch.float32,
+                param_dtype=torch.bfloat16,
                 auto_wrap_policy=partial(
                     lambda_auto_wrap_policy,
                     lambda_fn=lambda m: m in model.blocks,
@@ -360,7 +364,7 @@ def get_conditioning_for_prompts(tokenizer, encoder, device, prompts: List[str])
     # Sometimes returns a tensor, othertimes a tuple, not sure why
     # See: https://huggingface.co/genmo/mochi-1-preview/discussions/3
     assert tuple(y_feat[-1].shape) == (B, MAX_T5_TOKEN_LENGTH, 4096)
-    assert y_feat[-1].dtype == torch.float32
+    assert y_feat[-1].dtype == torch.bfloat16
 
     return dict(y_mask=y_mask, y_feat=y_feat)
 
@@ -409,7 +413,6 @@ def sample_model(device, dit, conditioning, **args):
     random.seed(args["seed"])
     np.random.seed(args["seed"])
     torch.manual_seed(args["seed"])
-
     generator = torch.Generator(device=device)
     generator.manual_seed(args["seed"])
 
@@ -436,7 +439,7 @@ def sample_model(device, dit, conditioning, **args):
     z = torch.randn(
         (B, IN_CHANNELS, latent_t, latent_h, latent_w),
         device=device,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
     )
 
     num_latents = latent_t * latent_h * latent_w
@@ -477,11 +480,128 @@ def sample_model(device, dit, conditioning, **args):
             sigma=torch.full([B] if cond_text else [B * 2], sigma, device=z.device),
             cfg_scale=cfg_schedule[i],
         )
-        assert pred.dtype == torch.float32
+        assert pred.dtype == torch.bfloat16
         z = z + dsigma * pred
 
     z = z[:B] if cond_batched else z
     return dit_latents_to_vae_latents(z)
+
+
+
+
+def sample_model_w_image(device, dit, vae_encoder,conditioning,starting_image,video_path,**args):
+    if(starting_image and video_path):
+        raise Exception("Cannot have both a Starting Image and Video Path")
+    
+    random.seed(args["seed"])
+    np.random.seed(args["seed"])
+    torch.manual_seed(args["seed"])
+    generator = torch.Generator(device=device)
+    generator.manual_seed(args["seed"])
+    strength = args["strength"]
+
+    w, h, t = args["width"], args["height"], args["num_frames"]
+    sample_steps = args["num_inference_steps"]
+    cfg_schedule = args["cfg_schedule"]
+    sigma_schedule = args["sigma_schedule"]
+    if(starting_image):
+        transform = T.Resize(size = (h, w), interpolation=T.InterpolationMode.BICUBIC, antialias=True)
+        # Step 2 Read in image, and mock it as a video 
+        conditioned_image = decode_image(starting_image) ##    Reads in an image as CxHxW, we need to convert it to CxTxHxW, we are mocking it in T
+        conditioned_image = transform(conditioned_image)
+        video = conditioned_image.unsqueeze(1).repeat(1,t+1,1,1) ## Introduces an artificial T dimension and repeats it in that dimension
+        interweave_frequency = args["interweave_frequency"]
+        repeat = [i//6 for i in range(0,t-1) if i%interweave_frequency==0]
+    if(video_path):
+        sequence_of_frames,_,_ =  read_video(str(video_path), output_format="THWC", pts_unit="secs")
+        video = rearrange(sequence_of_frames, "t h w c -> c t h w")
+        og_shape = video.shape
+        assert video.shape[2] == h, f"Expected {video_path} to have height {h}, got {video.shape}"
+        assert video.shape[3] == w, f"Expected {video_path} to have width {w}, got {video.shape}"
+        assert video.shape[1] >= t, f"Expected {video_path} to have at least {t} frames, got {video.shape}"
+        if video.shape[1] > t:
+            video = video[:, :t]
+            print(f"Trimmed video from {og_shape[1]} to first {T} frames")
+    video = video.unsqueeze(0) ## Introduces the Batch, now the image is a video of BxCxTxHxW
+    video = video.float()/127.5 -1.0
+    video = video.to(device=device)
+    video = add_fourier_features(video)
+    with move_to_device(vae_encoder,device):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            actual_latents = vae_encoder(video)
+    
+    #mask_latents =  torch.ones_like(actual_latents.mean)  
+    #mask_latents[:,:,repeat,:,:] = 0
+    assert_eq(len(cfg_schedule), sample_steps, "cfg_schedule must have length sample_steps")
+    assert_eq((t - 1) % 6, 0, "t - 1 must be divisible by 6")
+    assert_eq(
+        len(sigma_schedule),
+        sample_steps + 1,
+        "sigma_schedule must have length sample_steps + 1",
+    )
+
+    B = 1
+    SPATIAL_DOWNSAMPLE = 8
+    TEMPORAL_DOWNSAMPLE = 6
+    IN_CHANNELS = 12
+    latent_t = ((t - 1) // TEMPORAL_DOWNSAMPLE) + 1
+    latent_w, latent_h = w // SPATIAL_DOWNSAMPLE, h // SPATIAL_DOWNSAMPLE
+    z = torch.randn(
+        (B, IN_CHANNELS, latent_t, latent_h, latent_w),
+        device=device,
+        dtype=torch.bfloat16,
+    )*np.sqrt(strength)
+    noised_video_latents,noise,clean_latents = actual_latents.sample() ## Returns the noised video latents, noise, and latents before noise is added
+    noised_video_latents = vae_latents_to_dit_latents(noised_video_latents)
+    num_latents = latent_t * latent_h * latent_w
+    cond_batched = cond_text = cond_null = None
+    breakpoint()
+    if "cond" in conditioning:
+        cond_text = conditioning["cond"]
+        cond_null = conditioning["null"]
+        cond_text["packed_indices"] = compute_packed_indices(device, cond_text["y_mask"][0], num_latents)
+        cond_null["packed_indices"] = compute_packed_indices(device, cond_null["y_mask"][0], num_latents)
+    else:
+        cond_batched = conditioning["batched"]
+        cond_batched["packed_indices"] = compute_packed_indices(device, cond_batched["y_mask"][0], num_latents)
+        z = repeat(z, "b ... -> (repeat b) ...", repeat=2)
+
+    def model_fn(*, z, sigma, cfg_scale):
+        if cond_batched:
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = dit(z, sigma, **cond_batched)
+            out_cond, out_uncond = torch.chunk(out, chunks=2, dim=0)
+        else:
+            nonlocal cond_text, cond_null
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out_cond = dit(z, sigma, **cond_text)
+                out_uncond = dit(z, sigma, **cond_null)
+        assert out_cond.shape == out_uncond.shape
+        out_uncond = out_uncond.to(z)
+        out_cond = out_cond.to(z)
+        return out_uncond + cfg_scale * (out_cond - out_uncond)
+    z = (1-strength)*noised_video_latents+strength*z
+    # Euler sampler w/ customizable sigma schedule & cfg scale
+    for i in get_new_progress_bar(range(0, sample_steps), desc="Sampling"):
+        sigma = sigma_schedule[i]
+        dsigma = sigma - sigma_schedule[i + 1]
+        # `pred` estimates `z_0 - eps`.
+        pred = model_fn(
+            z=z,
+            sigma=torch.full([B] if cond_text else [B * 2], sigma, device=z.device),
+            cfg_scale=cfg_schedule[i],
+        )
+        assert pred.dtype == torch.bfloat16
+
+        z = z + dsigma * pred
+        #original_latents_with_noise = (1-sigma_schedule[i+1])*clean_latents+sigma_schedule[i+1]*noise
+        #z = (1-mask_latents)*original_latents_with_noise+ mask_latents*z
+
+
+    z = z[:B] if cond_batched else z
+    return dit_latents_to_vae_latents(z)
+
+
 
 
 @contextmanager
@@ -496,6 +616,7 @@ def move_to_device(model: nn.Module, target_device, *, enabled=True):
     else:
         print(f"moving model from {og_device} -> {target_device}")
 
+    model.to(torch.bfloat16)
     model.to(target_device)
     yield
     if og_device != target_device:
@@ -513,6 +634,7 @@ class MochiSingleGPUPipeline:
         *,
         text_encoder_factory: ModelFactory,
         dit_factory: ModelFactory,
+        encoder_factory: ModelFactory,
         decoder_factory: ModelFactory,
         cpu_offload: Optional[bool] = False,
         decode_type: str = "full",
@@ -520,7 +642,7 @@ class MochiSingleGPUPipeline:
         fast_init=True,
         strict_load=True
     ):
-        self.device = torch.device("cuda:0")
+        self.device = torch.device("cuda:6")
         self.tokenizer = t5_tokenizer(text_encoder_factory.model_dir)
         t = Timer()
         self.cpu_offload = cpu_offload
@@ -535,11 +657,13 @@ class MochiSingleGPUPipeline:
             )
         with t("load_dit"):
             self.dit = dit_factory.get_model(local_rank=0, device_id=init_id, world_size=1, fast_init=fast_init, strict_load=strict_load) # type: ignore
-        with t("load_vae"):
+        with t("load_vae_decoder"):
             self.decoder = decoder_factory.get_model(local_rank=0, device_id=init_id, world_size=1)
+        with t("load_vae_encoder"):
+            self.encoder = encoder_factory.get_model(local_rank=0,device_id=init_id,world_size=1)
         t.print_stats()
 
-    def __call__(self, batch_cfg, prompt, negative_prompt, **kwargs):
+    def __call__(self, batch_cfg, prompt, negative_prompt,starting_image,video_path, **kwargs):
         with torch.inference_mode():
             print_max_memory = lambda: print(
                 f"Max memory reserved: {torch.cuda.max_memory_reserved() / 1024**3:.2f} GB"
@@ -558,7 +682,10 @@ class MochiSingleGPUPipeline:
             print_max_memory()
 
             with move_to_device(self.dit, self.device):
-                latents = sample_model(self.device, self.dit, conditioning, **kwargs)
+                if(starting_image or video_path):
+                    latents = sample_model_w_image(self.device,self.dit,self.encoder,conditioning,starting_image,video_path,**kwargs)
+                else:
+                    latents = sample_model(self.device, self.dit, conditioning, **kwargs)
             print_max_memory()
 
             with move_to_device(self.decoder, self.device):

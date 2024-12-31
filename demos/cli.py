@@ -16,12 +16,13 @@ from genmo.mochi_preview.pipelines import (
     MochiSingleGPUPipeline,
     T5ModelFactory,
     linear_quadratic_schedule,
+    EncoderModelFactory,
 )
 
 pipeline = None
 model_dir_path = None
 lora_path = None
-num_gpus = torch.cuda.device_count()
+num_gpus = 1
 cpu_offload = False
 
 
@@ -48,6 +49,7 @@ def load_model():
             decoder_factory=DecoderModelFactory(
                 model_path=f"{MOCHI_DIR}/decoder.safetensors",
             ),
+            encoder_factory=EncoderModelFactory(model_path=f"{MOCHI_DIR}/encoder.safetensors")
         )
         if num_gpus > 1:
             assert not lora_path, f"Lora not supported in multi-GPU mode"
@@ -65,20 +67,19 @@ def load_model():
 def generate_video(
     prompt,
     negative_prompt,
+    strength,
     width,
     height,
     num_frames,
     seed,
     cfg_scale,
     num_inference_steps,
-    threshold_noise=0.025,
-    linear_steps=None,
-    output_dir="outputs",
 ):
     load_model()
 
-    # Fast mode parameters: threshold_noise=0.1, linear_steps=6, cfg_scale=1.5, num_inference_steps=8
-    sigma_schedule = linear_quadratic_schedule(num_inference_steps, threshold_noise, linear_steps)
+    # sigma_schedule should be a list of floats of length (num_inference_steps + 1),
+    # such that sigma_schedule[0] == 1.0 and sigma_schedule[-1] == 0.0 and monotonically decreasing.
+    sigma_schedule = linear_quadratic_schedule(num_inference_steps, 0.025)
 
     # cfg_schedule should be a list of floats of length num_inference_steps.
     # For simplicity, we just use the same cfg scale at all timesteps,
@@ -90,6 +91,7 @@ def generate_video(
         "height": height,
         "width": width,
         "num_frames": num_frames,
+        "strength":strength,
         "sigma_schedule": sigma_schedule,
         "cfg_schedule": cfg_schedule,
         "num_inference_steps": num_inference_steps,
@@ -99,6 +101,9 @@ def generate_video(
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "seed": seed,
+        "starting_image":starting_image,
+        "video_path":video_path,
+        "interweave_frequency":interweave_frequency
     }
 
     with progress_bar(type="tqdm"):
@@ -136,69 +141,31 @@ inviting atmosphere.
 @click.option("--prompt", default=DEFAULT_PROMPT, help="Prompt for video generation.")
 @click.option("--sweep-file", help="JSONL file containing one config per line.")
 @click.option("--negative_prompt", default="", help="Negative prompt for video generation.")
+@click.option("--strength",default=1,type=float,help="Strength to use for Video-to-Video Generation")
 @click.option("--width", default=848, type=int, help="Width of the video.")
 @click.option("--height", default=480, type=int, help="Height of the video.")
-@click.option("--num_frames", default=163, type=int, help="Number of frames.")
+@click.option("--num_frames", default=31, type=int, help="Number of frames.")
 @click.option("--seed", default=1710977262, type=int, help="Random seed.")
 @click.option("--cfg_scale", default=6.0, type=float, help="CFG Scale.")
 @click.option("--num_steps", default=64, type=int, help="Number of inference steps.")
 @click.option("--model_dir", required=True, help="Path to the model directory.")
 @click.option("--lora_path", required=False, help="Path to the lora file.")
 @click.option("--cpu_offload", is_flag=True, help="Whether to offload model to CPU")
-@click.option("--out_dir", default="outputs", help="Output directory for generated videos")
-@click.option("--threshold-noise", default=0.025, help="threshold noise")
-@click.option("--linear-steps", default=None, type=int, help="linear steps")
 def generate_cli(
-    prompt, sweep_file, negative_prompt, width, height, num_frames, seed, cfg_scale, num_steps, 
-    model_dir, lora_path, cpu_offload, out_dir, threshold_noise, linear_steps
+    prompt, negative_prompt, width, height, num_frames, seed, cfg_scale, num_steps, model_dir, lora_path, cpu_offload
 ):
     configure_model(model_dir, lora_path, cpu_offload)
-
-    if sweep_file:
-        with open(sweep_file, 'r') as f:
-            for i, line in enumerate(f):
-                if not line.strip():
-                    continue
-                config = json.loads(line)
-                current_prompt = config.get('prompt', prompt)
-                current_cfg_scale = config.get('cfg_scale', cfg_scale)
-                current_num_steps = config.get('num_steps', num_steps)
-                current_threshold_noise = config.get('threshold_noise', threshold_noise)
-                current_linear_steps = config.get('linear_steps', linear_steps)
-                current_seed = config.get('seed', seed)
-                current_width = config.get('width', width)
-                current_height = config.get('height', height)
-                current_num_frames = config.get('num_frames', num_frames)
-
-                output_path = generate_video(
-                    current_prompt,
-                    negative_prompt,
-                    current_width,
-                    current_height,
-                    current_num_frames,
-                    current_seed,
-                    current_cfg_scale,
-                    current_num_steps,
-                    threshold_noise=current_threshold_noise,
-                    linear_steps=current_linear_steps,
-                    output_dir=out_dir,
-                )
-                click.echo(f"Video {i+1} generated at: {output_path}")
-    else:
-        output_path = generate_video(
-            prompt,
-            negative_prompt,
-            width,
-            height,
-            num_frames,
-            seed,
-            cfg_scale,
-            num_steps,
-            threshold_noise=threshold_noise,
-            linear_steps=linear_steps,
-            output_dir=out_dir,
-        )
-        click.echo(f"Video generated at: {output_path}")
+    output = generate_video(
+        prompt,
+        negative_prompt,
+        width,
+        height,
+        num_frames,
+        seed,
+        cfg_scale,
+        num_steps,
+    )
+    click.echo(f"Video generated at: {output}")
 
 
 if __name__ == "__main__":
