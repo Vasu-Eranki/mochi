@@ -16,12 +16,13 @@ from genmo.mochi_preview.pipelines import (
     MochiSingleGPUPipeline,
     T5ModelFactory,
     linear_quadratic_schedule,
+    EncoderModelFactory,
 )
 
 pipeline = None
 model_dir_path = None
 lora_path = None
-num_gpus = torch.cuda.device_count()
+num_gpus = 1
 cpu_offload = False
 
 
@@ -48,6 +49,7 @@ def load_model():
             decoder_factory=DecoderModelFactory(
                 model_path=f"{MOCHI_DIR}/decoder.safetensors",
             ),
+            encoder_factory=EncoderModelFactory(model_path=f"{MOCHI_DIR}/encoder.safetensors")
         )
         if num_gpus > 1:
             assert not lora_path, f"Lora not supported in multi-GPU mode"
@@ -65,20 +67,24 @@ def load_model():
 def generate_video(
     prompt,
     negative_prompt,
+    strength,
     width,
     height,
     num_frames,
     seed,
     cfg_scale,
     num_inference_steps,
-    threshold_noise=0.025,
+    threshold_noise=0,
     linear_steps=None,
     output_dir="outputs",
+    starting_image=None,
+    video_path=None,
+    interweave_frequency=30
 ):
     load_model()
 
     # Fast mode parameters: threshold_noise=0.1, linear_steps=6, cfg_scale=1.5, num_inference_steps=8
-    sigma_schedule = linear_quadratic_schedule(num_inference_steps, threshold_noise, linear_steps)
+    sigma_schedule = linear_quadratic_schedule(num_inference_steps, threshold_noise, linear_steps,strength)
 
     # cfg_schedule should be a list of floats of length num_inference_steps.
     # For simplicity, we just use the same cfg scale at all timesteps,
@@ -90,6 +96,7 @@ def generate_video(
         "height": height,
         "width": width,
         "num_frames": num_frames,
+        "strength":strength,
         "sigma_schedule": sigma_schedule,
         "cfg_schedule": cfg_schedule,
         "num_inference_steps": num_inference_steps,
@@ -99,6 +106,9 @@ def generate_video(
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "seed": seed,
+        "starting_image":starting_image,
+        "video_path":video_path,
+        "interweave_frequency":interweave_frequency
     }
 
     with progress_bar(type="tqdm"):
@@ -136,9 +146,10 @@ inviting atmosphere.
 @click.option("--prompt", default=DEFAULT_PROMPT, help="Prompt for video generation.")
 @click.option("--sweep-file", help="JSONL file containing one config per line.")
 @click.option("--negative_prompt", default="", help="Negative prompt for video generation.")
+@click.option("--strength",default=1,type=float,help="Strength to use for Video-to-Video Generation")
 @click.option("--width", default=848, type=int, help="Width of the video.")
 @click.option("--height", default=480, type=int, help="Height of the video.")
-@click.option("--num_frames", default=163, type=int, help="Number of frames.")
+@click.option("--num_frames", default=31, type=int, help="Number of frames.")
 @click.option("--seed", default=1710977262, type=int, help="Random seed.")
 @click.option("--cfg_scale", default=6.0, type=float, help="CFG Scale.")
 @click.option("--num_steps", default=64, type=int, help="Number of inference steps.")
@@ -148,9 +159,12 @@ inviting atmosphere.
 @click.option("--out_dir", default="outputs", help="Output directory for generated videos")
 @click.option("--threshold-noise", default=0.025, help="threshold noise")
 @click.option("--linear-steps", default=None, type=int, help="linear steps")
+@click.option("--starting_image",required=False,help="Path to image")
+@click.option("--video_path",required=False,help="Path to video")
+@click.option("--interweave_frequency",type=int,required=False,help="How frequently to interweave the image with the video")
 def generate_cli(
-    prompt, sweep_file, negative_prompt, width, height, num_frames, seed, cfg_scale, num_steps, 
-    model_dir, lora_path, cpu_offload, out_dir, threshold_noise, linear_steps
+    prompt, sweep_file, negative_prompt, strength,width, height, num_frames, seed, cfg_scale, num_steps, 
+    model_dir, lora_path, cpu_offload, out_dir, threshold_noise, linear_steps,starting_image,video_path,interweave_frequency
 ):
     configure_model(model_dir, lora_path, cpu_offload)
 
@@ -188,6 +202,7 @@ def generate_cli(
         output_path = generate_video(
             prompt,
             negative_prompt,
+            strength,
             width,
             height,
             num_frames,
@@ -197,6 +212,9 @@ def generate_cli(
             threshold_noise=threshold_noise,
             linear_steps=linear_steps,
             output_dir=out_dir,
+            starting_image=starting_image,
+            video_path=video_path,
+            interweave_frequency=interweave_frequency
         )
         click.echo(f"Video generated at: {output_path}")
 

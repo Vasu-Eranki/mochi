@@ -348,7 +348,7 @@ def main(config_path):
 
         with torch.no_grad(), timer("load_batch", enabled=False):
             batch = get_batch()
-            embed, z, eps, sigma = map_to_device(batch, device)
+            embed, z, eps, sigma = map_to_device(batch, device) ## z is noise+mean, eps is random noise and sigma is variances from 0 to 1
             embed = cast(Dict[str, Any], embed)
 
             num_latent_toks = np.prod(z.shape[-3:])
